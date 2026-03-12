@@ -6,7 +6,8 @@ App(
     requires=["gui", "storage", "notification"],
     stack_size=2 * 1024,
     fap_category="Tools",
-    fap_version=(1, 0),
+    fap_version=(2, 0),
+    fap_icon="icon.png",
     fap_description="Scans Sub-GHz frequencies, shows live RSSI waveform, and logs detections above threshold to CSV on SD card.",
-    fap_author="OscarLauen",
+    fap_author="Smoodiehacking",
 )
