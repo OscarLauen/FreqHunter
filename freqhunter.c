@@ -102,7 +102,7 @@ static const FreqEntry FREQS[] = {
 #define THR_MAX      -40
 #define THR_STEP     5
 
-#define SET_N        4     /* number of settings: Sound, Mod, Freq, AutoHop */
+#define SET_N        5     /* number of settings: Sound, Mod, Freq, AutoHop, BinRaw */
 
 /* ── pages ──────────────────────────────────────────────────────────────── */
 typedef enum {
@@ -145,6 +145,7 @@ typedef struct {
     bool sound_on;
     int  mod_idx;
     bool auto_hop;
+    bool bin_raw;         /* binary raw format */
     int  threshold;       /* dBm integer */
     int  hop_speed;       /* 1=slow 2=med 3=fast */
     int  set_cur;
@@ -611,6 +612,7 @@ static const char* SET_LABELS[] = {
     "  Modulation",
     "  Frequency",
     "  Auto-Hop",
+    "  Bin Raw",
 };
 /* ── DRAW: SETTINGS ─────────────────────────────────────────────────────── */
 static void draw_settings(Canvas* c, App* app) {
@@ -629,11 +631,12 @@ static void draw_settings(Canvas* c, App* app) {
     set_vals[1] = MODS[app->mod_idx].name;
     set_vals[2] = freq_buf;
     set_vals[3] = app->auto_hop ? "ON " : "OFF";
+    set_vals[4] = app->bin_raw ? "ON " : "OFF";
 
     for(int i = 0; i < SET_N; i++) {
-        int y = 22 + i * 11;
+        int y = 20 + i * 9;
         if(i == app->set_cur) {
-            canvas_draw_box(c, 0, y - 9, 128, 11);
+            canvas_draw_box(c, 0, y - 8, 128, 10);
             canvas_set_color(c, ColorWhite);
         }
         canvas_draw_str(c, 2, y, SET_LABELS[i]);
@@ -712,6 +715,7 @@ int32_t freqhunter_app(void* p) {
     app->sound_on   = true;
     app->mod_idx    = 0;
     app->auto_hop   = false;
+    app->bin_raw    = false;
     app->hop_speed  = 2;
     app->dec_state  = DecIdle;
     for(int i = 0; i < HISTORY_LEN; i++) app->history[i] = -110.0f;
@@ -1006,6 +1010,7 @@ int32_t freqhunter_app(void* p) {
                         if(app->set_cur == 1) app->mod_idx = (app->mod_idx+1) % MOD_COUNT;
                         if(app->set_cur == 2) app->freq_idx = (app->freq_idx+1) % FREQ_COUNT;
                         if(app->set_cur == 3) app->auto_hop = !app->auto_hop;
+                        if(app->set_cur == 4) app->bin_raw = !app->bin_raw;
                         break;
                     case InputKeyLeft:
                         if(app->set_cur == 1)
