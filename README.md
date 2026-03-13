@@ -123,7 +123,7 @@ ufbt launch   # build + deploy over USB
 
 ## Author
 
-**Smoodiehacking** — [github.com/OscarLauen/FreqHunter](https://github.com/OscarLauen/FreqHunter)
+**Smoodiehacking** — [github.com/Smoodiehacking/FreqHunter](https://github.com/Smoodiehacking/FreqHunter)
 
 ---
 
@@ -205,4 +205,4 @@ Valid range: **300 000 000 – 928 000 000 Hz**
 
 ## Author
 
-Made by oscarlauenbach
+Made by Smoodiehacking
