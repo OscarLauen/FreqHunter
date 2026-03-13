@@ -1,5 +1,6 @@
 # FreqHunter 🎯
 ### A Sub-GHz RF Signal Logger for Flipper Zero
+### With help From Claude Sonnet 4.6 
 
 FreqHunter scans Sub-GHz frequencies (300–928 MHz), displays a **live RSSI
 waveform** on the Flipper's 128×64 screen, and logs every signal that exceeds
