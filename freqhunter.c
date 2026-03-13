@@ -24,6 +24,7 @@
 #include <input/input.h>
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
+#include <dialogs/dialogs.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@
 #define HOLD_2S        25    /* ticks for 2-second hold  (2000/80) */
 #define CAPTURE_MAX    512   /* max pulse edges in decoder */
 #define SPEC_SAMPLES   6     /* samples averaged per freq in spectrum */
+#define SEND_BUF_MAX   2048  /* max pulse durations to load from .sub file */
 
 /* ── CC1101 register presets ────────────────────────────────────────────── */
 static const uint8_t MOD_AM650[] = {          /* OOK 650 kHz BW */
@@ -82,20 +84,23 @@ static const ModPreset MODS[] = {
 #define MOD_COUNT 4
 
 /* ── frequencies ────────────────────────────────────────────────────────── */
-typedef struct { uint32_t hz; const char* label; } FreqEntry;
+typedef struct {
+    uint32_t hz;
+    const char* label;
+} FreqEntry;
+
 static const FreqEntry FREQS[] = {
-    /* Low band 300-348 MHz */
-    {300000000,"300"}, {310000000,"310"}, {315000000,"315"}, {318000000,"318"},
-    {330000000,"330"}, {345000000,"345"},
-    /* Mid band 387-464 MHz */
-    {390000000,"390"}, {400000000,"400"}, {418000000,"418"}, {433920000,"433"},
-    {434420000,"434"}, {450000000,"450"}, {460000000,"460"},
-    /* High band 779-928 MHz */
-    {779000000,"779"}, {800000000,"800"}, {820000000,"820"}, {868350000,"868"},
-    {900000000,"900"}, {905000000,"905"}, {915000000,"915"}, {920000000,"920"},
-    {928000000,"928"},
+    /* ISM bands - verified Flipper Zero support */
+    {315000000, "315"},
+    {433920000, "433"},
+    {434420000, "434"},
+    {868000000, "868"},
+    {868350000, "868.35"},
+    {915000000, "915"},
+    {928000000, "928"},
 };
-#define FREQ_COUNT 24
+
+#define FREQ_COUNT 7
 
 #define THR_DEFAULT  -85
 #define THR_MIN      -110
@@ -104,19 +109,34 @@ static const FreqEntry FREQS[] = {
 
 #define SET_N        5     /* number of settings: Sound, Mod, Freq, AutoHop, BinRaw */
 
+/* ── send state ─────────────────────────────────────────────────────────── */
+typedef struct {
+    uint32_t pulses[SEND_BUF_MAX]; /* pulse durations in microseconds */
+    int      count;                /* total pulses loaded */
+    int      idx;                  /* current TX position (for callback) */
+    uint32_t frequency;            /* frequency from .sub file */
+    char     filename[64];         /* short name for display */
+    char     filepath[256];        /* full path */
+    bool     loaded;               /* file successfully loaded */
+    bool     sending;              /* TX in progress */
+    bool     done;                 /* TX completed */
+    bool     failed;               /* load failed */
+} SendData;
+
 /* ── pages ──────────────────────────────────────────────────────────────── */
 typedef enum {
     PageHome, PageScanner, PageSpectrum,
-    PageDecoder, PageSettings, PageAbout,
+    PageDecoder, PageSettings, PageAbout, PageSend,
 } AppPage;
 
-#define HOME_N 5
+#define HOME_N 6
 static const char* HOME_LABELS[HOME_N] = {
     "  > Scanner",
     "  > Spectrum",
     "  > Decoder",
     "  > Settings",
     "  > About",
+    "  > Send .sub",
 };
 
 
@@ -135,6 +155,7 @@ typedef struct {
     /* home */
     int     home_cur;
     int     home_anim;     /* tick counter for animation */
+    int     home_scroll;   /* first visible menu item index */
 
     /* hold tracking */
     bool     back_held;   uint32_t back_ticks;
@@ -156,6 +177,9 @@ typedef struct {
     int      peak;
     float    history[HISTORY_LEN];
     int      hist_pos;
+    int      rssi_smooth; /* smoothed RSSI for display */
+    int      smooth_count; /* counter for smoothing */
+    int      anim_tick;    /* animation counter for spectrum heartbeat */
     bool     logging;
     uint32_t log_count;
     uint32_t detections;
@@ -168,6 +192,9 @@ typedef struct {
     int  spec_scan_idx;           /* which freq we're currently sampling */
     int  spec_sample_count;
     int  spec_accum;
+
+    /* about page */
+    int     about_scroll;         /* scroll position for about page */
 
     /* decoder */
     DecState dec_state;
@@ -183,6 +210,9 @@ typedef struct {
     /* raw signal display (ProtoView style) */
     uint8_t  sigmap[110];   /* 0=low 1=high for display */
     int      sigmap_len;
+
+    /* send */
+    SendData send;
 
     /* furi */
     FuriMessageQueue* queue;
@@ -236,7 +266,95 @@ static void radio_stop_async(void) {
     furi_hal_subghz_sleep();
 }
 
-/* ── decoder helpers ────────────────────────────────────────────────────── */
+/* ── send helpers ───────────────────────────────────────────────────────── */
+static LevelDuration send_tx_cb(void* context) {
+    App* app = (App*)context;
+    if(app->send.idx >= app->send.count) {
+        return level_duration_reset();  /* signal TX complete */
+    }
+    uint32_t dur = app->send.pulses[app->send.idx];
+    /* alternate high/low: even idx = high (RF burst), odd idx = low (gap) */
+    bool level = (app->send.idx % 2 == 0);
+    app->send.idx++;
+    return level_duration_make(level, dur);
+}
+
+static void radio_start_tx(App* app) {
+    furi_hal_subghz_reset();
+    furi_hal_subghz_load_custom_preset(MODS[app->mod_idx].regs);
+    furi_hal_subghz_set_frequency_and_path(app->send.frequency);
+    furi_hal_subghz_start_async_tx(send_tx_cb, app);
+}
+static void radio_stop_tx(void) {
+    furi_hal_subghz_stop_async_tx();
+    furi_hal_subghz_sleep();
+}
+
+/* parse one RAW_Data line into app->send.pulses, returns number appended */
+static void send_parse_raw_line(App* app, const char* p) {
+    while(*p && app->send.count < SEND_BUF_MAX) {
+        while(*p == ' ' || *p == '\t') p++;
+        if(*p == '\0') break;
+        char* end;
+        long val = strtol(p, &end, 10);
+        if(end == p) break;  /* no number found */
+        p = end;
+        if(val != 0) {
+            /* store absolute duration - HAL alternates level automatically */
+            app->send.pulses[app->send.count++] = (uint32_t)(val < 0 ? -val : val);
+        }
+    }
+}
+
+static void send_load_file(App* app, const char* path) {
+    app->send.count   = 0;
+    app->send.idx     = 0;
+    app->send.loaded  = false;
+    app->send.failed  = false;
+    app->send.sending = false;
+    app->send.done    = false;
+    app->send.frequency = FREQS[app->freq_idx].hz; /* default */
+
+    File* f = storage_file_alloc(app->storage);
+    if(!storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        app->send.failed = true;
+        storage_file_free(f);
+        return;
+    }
+
+    char line[512];
+    int  li = 0;
+    char ch;
+    while(storage_file_read(f, &ch, 1) == 1) {
+        if(ch == '\n' || ch == '\r') {
+            line[li] = '\0';
+            if(li > 0) {
+                if(strncmp(line, "Frequency: ", 11) == 0) {
+                    char* endp = NULL;
+                    app->send.frequency = (uint32_t)strtoul(line + 11, &endp, 10);
+                } else if(strncmp(line, "RAW_Data: ", 10) == 0) {
+                    send_parse_raw_line(app, line + 10);
+                }
+            }
+            li = 0;
+        } else {
+            if(li < (int)(sizeof(line) - 1)) line[li++] = ch;
+        }
+    }
+    /* handle last line with no newline */
+    if(li > 0) {
+        line[li] = '\0';
+        if(strncmp(line, "RAW_Data: ", 10) == 0)
+            send_parse_raw_line(app, line + 10);
+    }
+
+    storage_file_close(f);
+    storage_file_free(f);
+    app->send.loaded = (app->send.count > 0);
+    app->send.failed = !app->send.loaded;
+}
+
+
 static uint32_t find_te(App* app) {
     if(app->pulse_count < 4) return 0;
     uint16_t buckets[40];
@@ -389,21 +507,20 @@ static void draw_home(Canvas* c, App* app) {
     for(int x = 128 - (app->home_anim % 20); x >= 0; x -= 20)
         canvas_draw_dot(c, x, 63);
 
-    /* title with pulse effect */
+    /* title - top left */
     canvas_set_font(c, FontPrimary);
-    int pulse = (app->home_anim / 5) % 4;
-    int title_y = 12 + (pulse > 1 ? 1 : 0);
-    canvas_draw_str(c, 24, title_y, "FreqHunter");
+    canvas_draw_str(c, 2, 12, "FreqHunter");
 
     /* animated underline */
     canvas_draw_line(c, 0, 14, 127, 14);
     int anim_x = (app->home_anim * 2) % 128;
     canvas_draw_line(c, anim_x, 15, (anim_x + 20) % 128, 15);
 
-    /* menu */
+    /* menu - 5 visible slots, scrolls with selection */
     canvas_set_font(c, FontSecondary);
-    for(int i = 0; i < HOME_N; i++) {
-        int y = 22 + i * 9;
+    for(int slot = 0; slot < 5 && (app->home_scroll + slot) < HOME_N; slot++) {
+        int i = app->home_scroll + slot;
+        int y = 22 + slot * 9;
         if(i == app->home_cur) {
             /* animated selection highlight */
             int highlight = (app->home_anim / 3) % 2;
@@ -415,6 +532,12 @@ static void draw_home(Canvas* c, App* app) {
             canvas_draw_str(c, 2, y, HOME_LABELS[i]);
         }
     }
+
+    /* scroll arrows */
+    if(app->home_scroll > 0)
+        canvas_draw_str(c, 121, 22, "^");
+    if(app->home_scroll + 5 < HOME_N)
+        canvas_draw_str(c, 121, 63, "v");
 
 }
 
@@ -440,15 +563,19 @@ static void draw_scanner(Canvas* c, App* app) {
     snprintf(buf, sizeof(buf), "%d/%d", app->freq_idx + 1, FREQ_COUNT);
     canvas_draw_str(c, 104, 18, buf);
 
-    /* RSSI + mod */
-    snprintf(buf, sizeof(buf), "RSSI: %d dBm  [%s]",
-             app->rssi, MODS[app->mod_idx].name);
+    /* RSSI */
+    snprintf(buf, sizeof(buf), "RSSI: %d", app->rssi);
     canvas_draw_str(c, 0, 27, buf);
+    
+    /* modulation - fixed position */
+    snprintf(buf, sizeof(buf), "[%s]", MODS[app->mod_idx].name);
+    canvas_draw_str(c, 75, 27, buf);
 
-    /* threshold + peak */
-    snprintf(buf, sizeof(buf), "T: %d  Peak: %d  Det: %lu",
-             app->threshold, app->peak, (unsigned long)app->detections);
+    /* threshold + peak + det - separated to fixed positions */
+    snprintf(buf, sizeof(buf), "T:%d Pk:%d", app->threshold, app->peak);
     canvas_draw_str(c, 0, 35, buf);
+    snprintf(buf, sizeof(buf), "Det:%lu", (unsigned long)app->detections);
+    canvas_draw_str(c, 85, 35, buf);
 
     /* waveform box */
     const int WY0 = 37, WY1 = 56, WH = WY1 - WY0;
@@ -457,7 +584,7 @@ static void draw_scanner(Canvas* c, App* app) {
     /* threshold dashed line */
     int ty = WY1 - rssi_bar(app->threshold, WH);
     if(ty < WY0) ty = WY0;
-        if(ty > WY1) ty = WY1;
+    if(ty > WY1) ty = WY1;
     for(int x = 1; x < HISTORY_LEN - 1; x += 4) {
         canvas_draw_dot(c, x, ty); canvas_draw_dot(c, x+1, ty);
     }
@@ -465,26 +592,24 @@ static void draw_scanner(Canvas* c, App* app) {
     /* peak hold line */
     int py = WY1 - rssi_bar(app->peak, WH);
     if(py < WY0) py = WY0;
-        if(py > WY1) py = WY1;
+    if(py > WY1) py = WY1;
     canvas_draw_line(c, 1, py, HISTORY_LEN - 2, py);
 
-    /* bars */
+    /* waveform spikes - draw from bottom, noise floor shows as 1px baseline */
     for(int i = 0; i < HISTORY_LEN; i++) {
-        int idx = (app->hist_pos + i) % HISTORY_LEN;
-        int px = rssi_bar((int)app->history[idx], WH);
-        if(px < 0) {
-            px = 0;
-        }
-        if(px > WH) {
-            px = WH;
-        }
-        if(px > 0) canvas_draw_line(c, i, WY1 - px, i, WY1);
+        int hidx = (app->hist_pos + i) % HISTORY_LEN;
+        int rssi_val = (int)app->history[hidx];
+        int bar_h = rssi_bar(rssi_val, WH);
+        if(bar_h < 1) bar_h = 1;  /* always show 1px noise floor */
+        if(bar_h > WH) bar_h = WH;
+        /* draw spike: vertical line from bottom up */
+        canvas_draw_line(c, i, WY1 - bar_h, i, WY1);
     }
 
-    /* status bar */
-    snprintf(buf, sizeof(buf), "Log: %lu", (unsigned long)app->log_count);
+    /* status bar - kept short to fit on screen */
+    snprintf(buf, sizeof(buf), "Log:%lu", (unsigned long)app->log_count);
     canvas_draw_str(c, 0, 64, buf);
-    canvas_draw_str(c, 80, 64, app->logging ? "OK=StopLog" : "OK=Log");
+    canvas_draw_str(c, 80, 64, app->logging ? "OK:Stop" : "OK:Log");
 }
 
 /* ── DRAW: SPECTRUM ─────────────────────────────────────────────────────── */
@@ -503,41 +628,58 @@ static void draw_spectrum(Canvas* c, App* app) {
              (unsigned long)mhz, (unsigned long)khz, MODS[app->mod_idx].name);
     canvas_draw_str(c, 0, 20, freq_str);
     
-    /* bar area: centered single bar */
+    /* heartbeat bar area */
     const int BY0 = 30, BY1 = 55, BH = BY1 - BY0;
-    const int bar_x = 50, bar_w = 30;
+    const int bar_x = 40, bar_w = 50;
 
-    /* draw bar for current frequency */
-    int rssi = app->spec_rssi[app->freq_idx];
+    /* get current RSSI for heartbeat */
+    int rssi = app->rssi;
     int peak = app->spec_peak[app->freq_idx];
 
-    /* bar */
+    /* convert RSSI to bar height with heartbeat scale (pulsing) */
     int bh = rssi_bar(rssi, BH);
-    if(bh < 0) {
-        bh = 0;
+    if(bh < 0) bh = 0;
+    if(bh > BH) bh = BH;
+    
+    /* add heartbeat pulse effect */
+    uint32_t tick = app->anim_tick % 20;  /* 20 tick cycle */
+    int pulse = 0;
+    if(tick < 5) {
+        pulse = (tick * BH) / 10;  /* rise for 5 ticks */
+    } else if(tick < 8) {
+        pulse = ((10 - tick) * BH) / 10;  /* fall for 3 ticks */
+    } else if(tick < 13) {
+        pulse = ((tick - 8) * BH) / 10;  /* rise again for 5 ticks */
+    } else {
+        pulse = ((18 - tick) * BH) / 10;  /* fall for remaining */
     }
-    if(bh > BH) {
-        bh = BH;
+    
+    /* draw the pulsing bar */
+    int display_height = bh + pulse;
+    if(display_height < 3) display_height = 3;  /* minimum visible pulse */
+    if(display_height > BH) display_height = BH;
+    
+    if(display_height > 0) {
+        canvas_draw_box(c, bar_x, BY1 - display_height, bar_w, display_height);
     }
-    if(bh > 0) canvas_draw_box(c, bar_x, BY1 - bh, bar_w, bh);
 
     /* peak line */
     int ph = rssi_bar(peak, BH);
-    if(ph < 0) {
-        ph = 0;
+    if(ph < 0) ph = 0;
+    if(ph > BH) ph = BH;
+    if(ph > 0) {
+        canvas_draw_line(c, bar_x, BY1 - ph, bar_x + bar_w, BY1 - ph);
+        canvas_draw_line(c, bar_x - 2, BY1 - ph, bar_x, BY1 - ph);
+        canvas_draw_line(c, bar_x + bar_w, BY1 - ph, bar_x + bar_w + 2, BY1 - ph);
     }
-    if(ph > BH) {
-        ph = BH;
-    }
-    if(ph > 0) canvas_draw_line(c, bar_x, BY1 - ph, bar_x + bar_w, BY1 - ph);
 
     /* bar border */
     canvas_draw_frame(c, bar_x - 1, BY0 - 1, bar_w + 2, BH + 2);
 
-    /* RSSI value display */
-    char rssi_str[16];
-    snprintf(rssi_str, sizeof(rssi_str), "RSSI: %d dBm", rssi);
-    canvas_draw_str(c, 0, 64, rssi_str);
+    /* RSSI and peak display */
+    char info_str[24];
+    snprintf(info_str, sizeof(info_str), "RSSI: %d dBm  Peak: %d", rssi, peak);
+    canvas_draw_str(c, 0, 64, info_str);
 }
 
 /* ── DRAW: DECODER ──────────────────────────────────────────────────────── */
@@ -626,7 +768,16 @@ static void draw_settings(Canvas* c, App* app) {
     uint32_t hz = FREQS[app->freq_idx].hz;
     uint32_t mhz = hz / 1000000;
     uint32_t khz = (hz % 1000000) / 1000;
-    snprintf(freq_buf, sizeof(freq_buf), "%lu.%03lu MHz", (unsigned long)mhz, (unsigned long)khz);
+    /* trim trailing zeros: 433920 -> 433.92, 315000 -> 315 */
+    if(khz == 0) {
+        snprintf(freq_buf, sizeof(freq_buf), "%lu MHz", (unsigned long)mhz);
+    } else if(khz % 100 == 0) {
+        snprintf(freq_buf, sizeof(freq_buf), "%lu.%lu MHz", (unsigned long)mhz, (unsigned long)(khz / 100));
+    } else if(khz % 10 == 0) {
+        snprintf(freq_buf, sizeof(freq_buf), "%lu.%02lu MHz", (unsigned long)mhz, (unsigned long)(khz / 10));
+    } else {
+        snprintf(freq_buf, sizeof(freq_buf), "%lu.%03lu MHz", (unsigned long)mhz, (unsigned long)khz);
+    }
     set_vals[0] = app->sound_on ? "ON " : "OFF";
     set_vals[1] = MODS[app->mod_idx].name;
     set_vals[2] = freq_buf;
@@ -646,18 +797,54 @@ static void draw_settings(Canvas* c, App* app) {
 }
 
 /* ── DRAW: ABOUT ────────────────────────────────────────────────────────── */
-static void draw_about(Canvas* c) {
+static void draw_about(Canvas* c, App* app) {
+    UNUSED(app);
     canvas_set_font(c, FontPrimary);
-    canvas_draw_str(c, 22, 10, "FreqHunter v4.0");
-    canvas_draw_line(c, 0, 12, 127, 12);
+    canvas_draw_str(c, 0, 9, "FreqHunter");
+    canvas_draw_line(c, 0, 11, 127, 11);
     canvas_set_font(c, FontSecondary);
-    canvas_draw_str(c, 0, 22, "By: Smoodiehacking");
-    canvas_draw_str(c, 0, 31, "Scanner + Spectrum + Decoder");
-    canvas_draw_line(c, 0, 33, 127, 33);
-    canvas_draw_str(c, 0, 42, "GitHub:");
-    canvas_draw_str(c, 0, 50, "OscarLauen/FreqHunter");
-    canvas_draw_str(c, 0, 58, "https://github.com");
-    canvas_draw_line(c, 0, 60, 127, 60);
+    canvas_draw_str(c, 0, 22, "v4.0  by Smoodiehacking");
+    canvas_draw_str(c, 0, 32, "Scanner + Spectrum");
+    canvas_draw_str(c, 0, 41, "Decoder + Send .sub");
+    canvas_draw_str(c, 0, 50, "github.com/OscarLauen");
+    canvas_draw_str(c, 0, 59, "     /FreqHunter");
+}
+
+/* ── DRAW: SEND ─────────────────────────────────────────────────────────── */
+static void draw_send(Canvas* c, App* app) {
+    canvas_set_font(c, FontPrimary);
+    canvas_draw_str(c, 0, 9, "Send .sub");
+    canvas_draw_line(c, 0, 11, 127, 11);
+    canvas_set_font(c, FontSecondary);
+
+    if(!app->send.loaded && !app->send.failed && !app->send.sending) {
+        canvas_draw_str(c, 0, 24, "OK = Browse files");
+        canvas_draw_str(c, 0, 34, "Back = Home");
+    } else if(app->send.failed) {
+        canvas_draw_str(c, 0, 24, "Failed to load file");
+        canvas_draw_str(c, 0, 34, "OK = Try again");
+    } else if(app->send.sending) {
+        canvas_draw_str(c, 0, 24, app->send.filename);
+        canvas_draw_str(c, 0, 34, "Sending...");
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%lu MHz",
+                 (unsigned long)(app->send.frequency / 1000000));
+        canvas_draw_str(c, 0, 44, buf);
+    } else if(app->send.done) {
+        canvas_draw_str(c, 0, 24, "Done!");
+        canvas_draw_str(c, 0, 34, app->send.filename);
+        canvas_draw_str(c, 0, 44, "OK = Send again");
+        canvas_draw_str(c, 0, 54, "Back = Home");
+    } else if(app->send.loaded) {
+        canvas_draw_str(c, 0, 24, app->send.filename);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%lu MHz  %d pulses",
+                 (unsigned long)(app->send.frequency / 1000000),
+                 app->send.count);
+        canvas_draw_str(c, 0, 34, buf);
+        canvas_draw_str(c, 0, 44, "OK = Send");
+        canvas_draw_str(c, 0, 54, "Back = Home");
+    }
 }
 
 /* ── main draw ──────────────────────────────────────────────────────────── */
@@ -665,12 +852,13 @@ static void draw_cb(Canvas* c, void* ctx) {
     App* app = (App*)ctx;
     canvas_clear(c);
     switch(app->page) {
-    case PageHome:     draw_home(c, app);     break;
-    case PageScanner:  draw_scanner(c, app);  break;
-    case PageSpectrum: draw_spectrum(c, app); break;
-    case PageDecoder:  draw_decoder(c, app);  break;
-    case PageSettings: draw_settings(c, app); break;
-    case PageAbout:    draw_about(c);         break;
+    case PageHome:     draw_home(c, app);      break;
+    case PageScanner:  draw_scanner(c, app);   break;
+    case PageSpectrum: draw_spectrum(c, app);  break;
+    case PageDecoder:  draw_decoder(c, app);   break;
+    case PageSettings: draw_settings(c, app);  break;
+    case PageAbout:    draw_about(c, app);     break;
+    case PageSend:     draw_send(c, app);      break;
     }
 }
 
@@ -691,6 +879,7 @@ static void go_home(App* app) {
     if(app->page == PageScanner)  radio_stop_plain();
     if(app->page == PageSpectrum) radio_stop_plain();
     if(app->page == PageDecoder)  radio_stop_async();
+    if(app->page == PageSend && app->send.sending) radio_stop_tx();
     if(app->logging) { log_close(app); app->logging = false; }
     app->page = PageHome;
 }
@@ -712,12 +901,15 @@ int32_t freqhunter_app(void* p) {
     app->threshold  = THR_DEFAULT;
     app->rssi       = -100;
     app->peak       = -110;
+    app->rssi_smooth = -100;
+    app->smooth_count = 0;
     app->sound_on   = true;
     app->mod_idx    = 0;
     app->auto_hop   = false;
     app->bin_raw    = false;
     app->hop_speed  = 2;
     app->dec_state  = DecIdle;
+    app->about_scroll = 0;
     for(int i = 0; i < HISTORY_LEN; i++) app->history[i] = -110.0f;
     for(int i = 0; i < FREQ_COUNT;  i++) {
         app->spec_rssi[i] = -110;
@@ -747,6 +939,7 @@ int32_t freqhunter_app(void* p) {
         /* ── TIMER ──────────────────────────────────────────────────── */
         if(ev.kind == EvTimer) {
             app->home_anim++;
+            app->anim_tick++;
 
             /* back hold to exit */
             if(app->back_held) {
@@ -784,8 +977,15 @@ int32_t freqhunter_app(void* p) {
             if(app->page == PageScanner) {
                 float rssi_f = furi_hal_subghz_get_rssi();
                 app->rssi = (int)rssi_f;
-                app->history[app->hist_pos] = rssi_f;
-                app->hist_pos = (app->hist_pos + 1) % HISTORY_LEN;
+                
+                /* smooth RSSI - only update history every 3 samples */
+                app->rssi_smooth = (app->rssi_smooth * 2 + app->rssi) / 3;
+                app->smooth_count++;
+                if(app->smooth_count >= 3) {
+                    app->history[app->hist_pos] = (float)app->rssi_smooth;
+                    app->hist_pos = (app->hist_pos + 1) % HISTORY_LEN;
+                    app->smooth_count = 0;
+                }
 
                 if(app->rssi > app->peak) app->peak = app->rssi;
                 else if(app->peak > -110) app->peak--;
@@ -794,7 +994,7 @@ int32_t freqhunter_app(void* p) {
                     app->detections++;
                     app->det_per_freq[app->freq_idx]++;
                     if(app->sound_on)
-                        notification_message(app->notif, &sequence_success);
+                        notification_message(app->notif, &sequence_blink_white_100);
                     if(app->logging) {
                         uint32_t ts = furi_get_tick() /
                             (furi_kernel_get_tick_frequency() / 1000);
@@ -817,29 +1017,22 @@ int32_t freqhunter_app(void* p) {
                 }
             }
 
-            /* spectrum tick - scan one freq per tick */
+            /* spectrum tick - monitor current frequency with heartbeat */
             if(app->page == PageSpectrum) {
                 float rssi_f = furi_hal_subghz_get_rssi();
                 int rssi = (int)rssi_f;
-                app->spec_accum += rssi;
-                app->spec_sample_count++;
-
-                if(app->spec_sample_count >= SPEC_SAMPLES) {
-                    int avg = app->spec_accum / app->spec_sample_count;
-                    app->spec_rssi[app->spec_scan_idx] = avg;
-                    if(avg > app->spec_peak[app->spec_scan_idx])
-                        app->spec_peak[app->spec_scan_idx] = avg;
-                    app->spec_accum = 0;
-                    app->spec_sample_count = 0;
-                    app->spec_scan_idx = (app->spec_scan_idx + 1) % FREQ_COUNT;
-                    /* tune to next freq */
-                    radio_stop_plain();
-                    furi_hal_subghz_reset();
-                    furi_hal_subghz_load_custom_preset(MODS[app->mod_idx].regs);
-                    furi_hal_subghz_set_frequency_and_path(
-                        FREQS[app->spec_scan_idx].hz);
-                    furi_hal_subghz_flush_rx();
-                    furi_hal_subghz_rx();
+                
+                /* update peak */
+                if(rssi > app->spec_peak[app->freq_idx])
+                    app->spec_peak[app->freq_idx] = rssi;
+                
+                /* smooth the RSSI display */
+                app->rssi_smooth += rssi;
+                app->smooth_count++;
+                if(app->smooth_count >= 3) {
+                    app->rssi = app->rssi_smooth / 3;
+                    app->rssi_smooth = 0;
+                    app->smooth_count = 0;
                 }
             }
 
@@ -851,6 +1044,17 @@ int32_t freqhunter_app(void* p) {
                     decode_protocol(app);
                     if(app->sound_on)
                         notification_message(app->notif, &sequence_success);
+                }
+            }
+
+            /* send TX completion check */
+            if(app->page == PageSend && app->send.sending) {
+                if(furi_hal_subghz_is_async_tx_complete()) {
+                    radio_stop_tx();
+                    app->send.sending = false;
+                    app->send.done    = true;
+                    if(app->sound_on)
+                        notification_message(app->notif, &sequence_blink_white_100);
                 }
             }
 
@@ -892,10 +1096,21 @@ int32_t freqhunter_app(void* p) {
 
                 /* HOME */
                 if(app->page == PageHome) {
-                    if(ev.input.key == InputKeyUp)
+                    if(ev.input.key == InputKeyUp) {
                         app->home_cur = (app->home_cur - 1 + HOME_N) % HOME_N;
-                    else if(ev.input.key == InputKeyDown)
+                        /* wrapped to bottom: show last 5 items */
+                        if(app->home_cur == HOME_N - 1)
+                            app->home_scroll = HOME_N > 5 ? HOME_N - 5 : 0;
+                        else if(app->home_cur < app->home_scroll)
+                            app->home_scroll = app->home_cur;
+                    } else if(ev.input.key == InputKeyDown) {
                         app->home_cur = (app->home_cur + 1) % HOME_N;
+                        /* wrapped to top: reset scroll */
+                        if(app->home_cur == 0)
+                            app->home_scroll = 0;
+                        else if(app->home_cur >= app->home_scroll + 5)
+                            app->home_scroll = app->home_cur - 4;
+                    }
                     else if(ev.input.key == InputKeyOk) {
                         switch(app->home_cur) {
                         case 0: /* Scanner */
@@ -929,6 +1144,16 @@ int32_t freqhunter_app(void* p) {
                             break;
                         case 4: /* About */
                             app->page = PageAbout;
+                            break;
+                        case 5: /* Send .sub */
+                            app->page = PageSend;
+                            /* reset send state, wait for user to browse */
+                            app->send.loaded  = false;
+                            app->send.failed  = false;
+                            app->send.sending = false;
+                            app->send.done    = false;
+                            app->send.count   = 0;
+                            app->send.filename[0] = '\0';
                             break;
                         }
                     }
@@ -979,7 +1204,7 @@ int32_t freqhunter_app(void* p) {
                         for(int i = 0; i < FREQ_COUNT; i++)
                             app->spec_peak[i] = -110;
                         if(app->sound_on)
-                            notification_message(app->notif, &sequence_success);
+                            notification_message(app->notif, &sequence_blink_white_100);
                     }
                 }
 
@@ -1025,6 +1250,55 @@ int32_t freqhunter_app(void* p) {
                             app->freq_idx = (app->freq_idx+1) % FREQ_COUNT;
                         break;
                     default: break;
+                    }
+                }
+
+                /* ABOUT PAGE */
+                else if(app->page == PageAbout) {
+                    /* no scrolling - all content shown */
+                }
+
+                else if(app->page == PageSend) {
+                    if(ev.input.key == InputKeyOk) {
+                        if(!app->send.loaded || app->send.failed) {
+                            /* browse for .sub file */
+                            DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+                            FuriString* path = furi_string_alloc_set("/ext/subghz");
+                            FuriString* selected = furi_string_alloc();
+                            DialogsFileBrowserOptions browser_opts;
+                            dialog_file_browser_set_basic_options(
+                                &browser_opts, ".sub", NULL);
+                            bool picked = dialog_file_browser_show(
+                                dialogs, selected, path, &browser_opts);
+                            furi_record_close(RECORD_DIALOGS);
+                            if(picked) {
+                                const char* fpath = furi_string_get_cstr(selected);
+                                strncpy(app->send.filepath, fpath,
+                                        sizeof(app->send.filepath) - 1);
+                                /* extract short filename */
+                                const char* slash = strrchr(fpath, '/');
+                                strncpy(app->send.filename,
+                                        slash ? slash + 1 : fpath,
+                                        sizeof(app->send.filename) - 1);
+                                send_load_file(app, fpath);
+                            }
+                            furi_string_free(selected);
+                            furi_string_free(path);
+                        } else if(app->send.loaded && !app->send.sending) {
+                            /* start transmitting */
+                            app->send.idx     = 0;
+                            app->send.sending = true;
+                            app->send.done    = false;
+                            radio_stop_plain();
+                            radio_start_tx(app);
+                        } else if(app->send.done) {
+                            /* send again */
+                            app->send.idx     = 0;
+                            app->send.sending = true;
+                            app->send.done    = false;
+                            radio_stop_plain();
+                            radio_start_tx(app);
+                        }
                     }
                 }
             }

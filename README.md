@@ -1,10 +1,9 @@
 # FreqHunter 🎯
-### A Sub-GHz RF Signal Logger for Flipper Zero
-### With help From Claude Sonnet 4.6 
+### Sub-GHz Scanner, Spectrum Analyzer, Decoder & Sender for Flipper Zero
 
-FreqHunter scans Sub-GHz frequencies (300–928 MHz), displays a **live RSSI
-waveform** on the Flipper's 128×64 screen, and logs every signal that exceeds
-your threshold to a **CSV file** on the SD card.
+FreqHunter is an all-in-one Sub-GHz toolkit. It combines a live RSSI waveform
+scanner, a spectrum monitor, a ProtoView-style pulse decoder, and a `.sub` file
+transmitter — all in a single app with an animated home menu.
 
 ---
 
@@ -12,40 +11,119 @@ your threshold to a **CSV file** on the SD card.
 
 | Feature | Detail |
 |---|---|
-| Frequency list | 10 ISM-band presets (315, 345, 390, 418, 433.92, 434.42, 868.35, 915 MHz…) |
-| Live waveform | 110-sample scrolling RSSI graph on the display |
-| Threshold line | Dashed line on the graph, adjustable in 5 dBm steps |
-| CSV logging | `timestamp_ms, frequency_hz, rssi_dbm` — appended across sessions |
-| LED feedback | Green blink on detection · Blue = logging started · Red = logging stopped |
-| Counters | Live detection count and log entry count on screen |
+| **Scanner** | Live 110-column scrolling RSSI waveform across 7 ISM frequencies |
+| **Spectrum** | Heartbeat-style RSSI monitor with peak hold on the selected frequency |
+| **Decoder** | Async pulse capture with ProtoView-style waveform display and protocol ID |
+| **Send .sub** | Browse SD card for `.sub` files and transmit them via the CC1101 |
+| **Settings** | Sound toggle, modulation preset, frequency, auto-hop on/off |
+| **CSV Logging** | `timestamp_ms, freq_hz, freq_label, rssi_dbm` appended to SD card |
+| **Auto-hop** | Cycle through all frequencies automatically at configurable speed |
+| **Modulations** | AM650, AM270, FM238, FM476 (CC1101 custom register presets) |
 
 ---
 
-## Screen Layout
+## Frequencies
 
-```
-FreqHunter                    [REC]
-433.920 MHz                   6/10
-RSSI: -72.5 dBm   Thr: -85 dBm
-┌──────────────────────────────────┐
-│     ▄▄  ▄                        │  ← live waveform
-│  - - - - - - - - - - - - - - - - │  ← threshold line
-│▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄│
-└──────────────────────────────────┘
-Log:47  Det:12              OK=Stop
-```
+| Label | Hz |
+|---|---|
+| 315 | 315 000 000 |
+| 433 | 433 920 000 |
+| 434 | 434 420 000 |
+| 868 | 868 000 000 |
+| 868.35 | 868 350 000 |
+| 915 | 915 000 000 |
+| 928 | 928 000 000 |
 
 ---
 
-## Controls
+## Pages & Controls
 
+### Home
+| Button | Action |
+|---|---|
+| **Up / Down** | Navigate menu (scrolls if needed) |
+| **OK** | Open selected page |
+| **Back (hold 2s)** | Exit app |
+
+### Scanner
 | Button | Action |
 |---|---|
 | **Up / Down** | Change frequency |
-| **Left** | Lower threshold by 5 dBm |
-| **Right** | Raise threshold by 5 dBm |
-| **OK** | Start / stop logging to SD card |
-| **Back** | Exit |
+| **Left / Right** | Adjust detection threshold (5 dBm steps) |
+| **OK** | Start / stop CSV logging |
+| **OK (hold)** | Toggle auto-hop |
+| **Right (hold 3s)** | Jump to Decoder |
+
+### Spectrum
+| Button | Action |
+|---|---|
+| **OK** | Reset peak hold |
+| **Back** | Return to Home |
+
+### Decoder
+| Button | Action |
+|---|---|
+| **Up / Down** | Change frequency, restart capture |
+| **OK** | Clear capture and listen again |
+| **Left (hold 3s)** | Jump to Scanner |
+
+### Send .sub
+| Button | Action |
+|---|---|
+| **OK** | Browse SD card for `.sub` file |
+| **OK** (after load) | Transmit the loaded file |
+| **OK** (after done) | Transmit again |
+| **Back** | Return to Home |
+
+### Settings
+| Button | Action |
+|---|---|
+| **Up / Down** | Navigate settings |
+| **OK / Left / Right** | Change value |
+
+---
+
+## Screen Layout (Scanner)
+
+```
+Scanner                     [LOG][HOP]
+433.920 MHz  433              7/7
+RSSI: -82          [AM650]
+T:-85 Pk:-78            Det:3
+┌──────────────────────────────────┐
+│  ▄  ▄▄    ▄  ▄▄▄   ▄            │  ← waveform spikes
+│- - - - - - - - - - - - - - - - -│  ← threshold
+└──────────────────────────────────┘
+Log:12                      OK:Log
+```
+
+---
+
+## Log File
+
+Saved to `/ext/apps_data/freqhunter/log.csv`:
+
+```
+timestamp_ms,freq_hz,freq_label,rssi_dbm
+12345,433920000,433,-78
+```
+
+---
+
+## Build
+
+Requires [ufbt](https://github.com/flipperdevices/flipperzero-ufbt):
+
+```sh
+ufbt build
+ufbt launch   # build + deploy over USB
+```
+
+---
+
+## Author
+
+**Smoodiehacking** — [github.com/OscarLauen/FreqHunter](https://github.com/OscarLauen/FreqHunter)
 
 ---
 
